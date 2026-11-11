@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +26,78 @@ import (
 // browser UA (as kxss does) lie about what is on the wire; this advertises the
 // tool so a defender can identify the traffic.
 const defaultUA = "kxss-ctx/1.0 (context-aware XSS reflection scanner; +https://github.com/amnotacat4074/kxss-ctx)"
+
+// severityRank orders severities for -min-severity filtering. Anything
+// unrecognised ranks below "info" and is therefore suppressed unless the
+// threshold is explicitly lowered (it cannot be, so it is suppressed).
+var severityRank = map[string]int{
+	"info":   0,
+	"low":    1,
+	"medium": 2,
+	"high":   3,
+}
+
+// ANSI SGR fragments. Only the severity token is coloured; the rest of the
+// line keeps the terminal's default foreground so it stays copy/paste-able.
+const (
+	ansiReset    = "\x1b[0m"
+	ansiHigh     = "\x1b[1;31m" // bold red
+	ansiMedium   = "\x1b[33m"   // yellow
+	ansiLow      = "\x1b[36m"   // cyan
+	ansiInfo     = "\x1b[2;90m" // dim grey
+	ansiNoColour = ""
+)
+
+func colorFor(severity string) string {
+	switch severity {
+	case "high":
+		return ansiHigh
+	case "medium":
+		return ansiMedium
+	case "low":
+		return ansiLow
+	case "info":
+		return ansiInfo
+	}
+	return ansiNoColour
+}
+
+// colorEnabled resolves the -color flag. Explicit "always" wins over NO_COLOR
+// (the operator asked for it); "auto" is disabled by NO_COLOR and by a
+// non-terminal stdout. JSON output is never coloured.
+func colorEnabled(mode string, jsonOut, noColor, isTTY bool) bool {
+	if jsonOut {
+		return false
+	}
+	switch mode {
+	case "always":
+		return true
+	case "never":
+		return false
+	default: // auto
+		return isTTY && !noColor
+	}
+}
+
+func stdoutIsTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// countingTransport counts every HTTP round trip (including any redirect
+// hops) so the final summary can report actual request volume.
+type countingTransport struct {
+	base http.RoundTripper
+	n    *atomic.Int64
+}
+
+func (t countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.n.Add(1)
+	return t.base.RoundTrip(req)
+}
 
 // headerList is a repeatable -H flag ("Name: value").
 type headerList struct{ h http.Header }
@@ -63,18 +136,20 @@ type task struct {
 
 func main() {
 	var (
-		single   string
-		file     string
-		jsonOut  bool
-		conc     int
-		rate     float64
-		timeout  time.Duration
-		follow   bool
-		insecure bool
-		ua       string
-		cookie   string
-		maxOcc   int
-		verbose  bool
+		single      string
+		file        string
+		jsonOut     bool
+		conc        int
+		rate        float64
+		timeout     time.Duration
+		follow      bool
+		insecure    bool
+		ua          string
+		cookie      string
+		maxOcc      int
+		verbose     bool
+		colorMode   string
+		minSeverity string
 	)
 	headers := &headerList{h: http.Header{}}
 	flag.StringVar(&single, "u", "", "single URL to test; must include a query string")
@@ -89,8 +164,24 @@ func main() {
 	flag.StringVar(&cookie, "cookie", "", "Cookie header value")
 	flag.IntVar(&maxOcc, "max-occ", 3, "max reflections to analyse per parameter")
 	flag.BoolVar(&verbose, "v", false, "verbose diagnostics on stderr")
+	flag.StringVar(&colorMode, "color", "auto", "colour output: auto|always|never (auto = only on a terminal; NO_COLOR disables auto; -json never colours)")
+	flag.StringVar(&minSeverity, "min-severity", "low", "minimum severity to report: info|low|medium|high")
 	flag.Var(headers, "H", "extra request header 'Name: value' (repeatable)")
 	flag.Parse()
+
+	if _, ok := severityRank[minSeverity]; !ok {
+		fmt.Fprintf(os.Stderr, "kxss-ctx: invalid -min-severity %q (want info, low, medium or high)\n", minSeverity)
+		os.Exit(2)
+	}
+	switch colorMode {
+	case "auto", "always", "never":
+	default:
+		fmt.Fprintf(os.Stderr, "kxss-ctx: invalid -color %q (want auto, always or never)\n", colorMode)
+		os.Exit(2)
+	}
+	noColorEnv := os.Getenv("NO_COLOR") != ""
+	useColor := colorEnabled(colorMode, jsonOut, noColorEnv, stdoutIsTerminal())
+	minRank := severityRank[minSeverity]
 
 	urls, err := readURLs(single, file)
 	if err != nil {
@@ -138,6 +229,12 @@ func main() {
 		Insecure: insecure,
 	}
 	client := newClient(opts)
+	var requestCount atomic.Int64
+	baseTransport := client.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	client.Transport = countingTransport{base: baseTransport, n: &requestCount}
 	lim := newLimiter(rate)
 
 	if conc < 1 {
@@ -179,13 +276,23 @@ func main() {
 	}()
 
 	var all []finding
+	reported := make(map[string]int)
+	suppressed := make(map[string]int)
 	for f := range results {
+		rank, known := severityRank[f.Severity]
+		if !known || rank < minRank {
+			suppressed[f.Severity]++
+			continue
+		}
+		reported[f.Severity]++
 		if jsonOut {
 			all = append(all, f)
 			continue
 		}
-		printFinding(os.Stdout, f)
+		printFinding(os.Stdout, f, useColor)
 	}
+
+	printSummary(os.Stderr, len(tasks), requestCount.Load(), minSeverity, reported, suppressed)
 
 	if !jsonOut {
 		return
@@ -271,8 +378,8 @@ func scanLines(r io.Reader) ([]string, error) {
 	return out, nil
 }
 
-func printFinding(w io.Writer, f finding) {
-	fmt.Fprintf(w, "[%s] %s  param=%q context=%s", f.Severity, f.URL, f.Param, f.Kind)
+func printFinding(w io.Writer, f finding, color bool) {
+	fmt.Fprintf(w, "[%s] %s  param=%q context=%s", formatSeverity(f.Severity, color), f.URL, f.Param, f.Kind)
 	if f.Tag != "" {
 		fmt.Fprintf(w, " tag=<%s>", f.Tag)
 	}
@@ -308,6 +415,38 @@ func printFinding(w io.Writer, f finding) {
 		fmt.Fprintf(w, "    snippet: %s\n", f.Snippet)
 	}
 	fmt.Fprintln(w)
+}
+
+func formatSeverity(severity string, color bool) string {
+	if !color {
+		return severity
+	}
+	c := colorFor(severity)
+	if c == "" {
+		return severity
+	}
+	return c + severity + ansiReset
+}
+
+// printSummary writes the run accounting to stderr. It deliberately goes to
+// stderr so -json stdout stays machine-parseable.
+func printSummary(w io.Writer, tasks int, requests int64, minSeverity string, reported, suppressed map[string]int) {
+	var parts []string
+	for _, sev := range []string{"high", "medium", "low", "info"} {
+		if n := reported[sev]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, sev))
+		}
+	}
+	for _, sev := range []string{"high", "medium", "low", "info"} {
+		if n := suppressed[sev]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s suppressed", n, sev))
+		}
+	}
+	detail := "no findings at or above " + minSeverity
+	if len(parts) > 0 {
+		detail = strings.Join(parts, ", ")
+	}
+	fmt.Fprintf(w, "kxss-ctx: scanned %d task(s), %d request(s): %s\n", tasks, requests, detail)
 }
 
 func orNone(s string) string {

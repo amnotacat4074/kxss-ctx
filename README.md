@@ -41,6 +41,9 @@ cat urls.txt | kxss-ctx
 # JSON for tooling
 kxss-ctx -json -f urls.txt
 
+# noisy target: only medium and above
+kxss-ctx -u 'https://example.test/search?q=1' -min-severity medium
+
 # authenticated / header-sensitive targets
 kxss-ctx -u 'https://example.test/?q=1' -cookie 'session=abc' -H 'X-Forwarded-Host: example.test' -H 'Origin: https://example.test'
 
@@ -66,11 +69,18 @@ Flags:
 | `-H` | | extra request header, `Name: value`; repeatable |
 | `-max-occ` | 3 | maximum reflections to analyse per parameter |
 | `-v` | off | diagnostics on stderr |
+| `-color` | `auto` | ANSI colour for the severity tag only: `auto` (only when stdout is a terminal), `always`, `never`. `NO_COLOR` disables `auto`; `-json` is never coloured. |
+| `-min-severity` | `low` | minimum severity to report (`info`, `low`, `medium`, `high`). Lower-severity findings are omitted from both human and JSON output and counted as suppressed in the summary. |
 
 URLs without a scheme are treated as `https://`.
 
 Exit status is `0` after a scan regardless of findings. Usage or I/O errors
 exit `2`; an error writing JSON exits `1`.
+
+After every scan a one-line accounting goes to stderr — tasks scanned,
+requests made, findings per severity, and how many were filtered by
+`-min-severity` (e.g. `3 high, 1 low, 412 info suppressed`). It stays on
+stderr so `-json` output remains machine-parseable.
 
 ## What it does
 
