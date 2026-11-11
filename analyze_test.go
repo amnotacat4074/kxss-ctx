@@ -75,11 +75,14 @@ func TestAnalyzeParamEndToEnd(t *testing.T) {
 		t.Errorf("encoded attr should not carry a PoC, got %q", f[0].PoC)
 	}
 
-	// 2b) quote encoded but "<" literal: high per the specification, with an
-	// explicit caveat that no terminating character survived.
+	// 2b) quote encoded but "<" literal in a double-quoted attribute: the
+	// quote is the only terminator, so this is a reflection, not a breakout.
 	f = run("/attr-mixed")
-	if len(f) != 1 || f[0].Severity != "high" || !strings.Contains(f[0].Verdict, "not demonstrated") {
+	if len(f) != 1 || f[0].Severity != "info" || !strings.Contains(f[0].Verdict, "not exploitable") {
 		t.Fatalf("mixed attr: %+v", f)
+	}
+	if f[0].PoC != "" {
+		t.Errorf("mixed attr must not carry a PoC, got %q", f[0].PoC)
 	}
 
 	// 3) text context with < stripped -> info, PoC withheld
@@ -123,16 +126,17 @@ func TestAnalyzeParamEndToEnd(t *testing.T) {
 		t.Fatalf("csp: %+v", f)
 	}
 
-	// 8) redirect-reflected parameter -> medium
+	// 8) relative redirect reflection -> info: a same-origin bounce is not an
+	// open redirect. Only a cross-origin Location is reported as high.
 	rf, err := analyzeParam(client, o, srv.URL+"/redir?x=1", "x", lim, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rf) != 1 || rf[0].Kind != "redirect-location" || rf[0].Severity != "medium" {
+	if len(rf) != 1 || rf[0].Kind != "redirect-location" || rf[0].Severity != "info" {
 		t.Fatalf("redirect: %+v", rf)
 	}
-	if !strings.Contains(rf[0].PoC, "attacker.example") {
-		t.Errorf("redirect poc: %q", rf[0].PoC)
+	if rf[0].PoC != "" {
+		t.Errorf("relative redirect should not carry a PoC, got %q", rf[0].PoC)
 	}
 }
 

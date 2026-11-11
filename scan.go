@@ -65,6 +65,7 @@ type Context struct {
 	Attr       string // attribute name, if the reflection is in one
 	ScriptType string // value of the <script type="..."> attribute
 	ValueStart int    // byte offset where the attribute value begins
+	DataScript bool   // <script> whose type is not JavaScript (JSON, template...)
 }
 
 type scanState int

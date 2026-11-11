@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -75,27 +76,34 @@ func analyzeParam(client *http.Client, o fetchOpts, rawurl, param string, lim *l
 	}
 	var out []finding
 
-	// 1. Reflection into a redirect target.
-	if res.Location != "" && strings.Contains(res.Location, marker) {
+	// 1. Reflection into a redirect target. Only a CROSS-ORIGIN target is an
+	//    open-redirect candidate. Echoing the value into a same-origin or
+	//    relative Location is routine (return-URL params, locale redirects,
+	//    auth bounce) and must not be reported as a finding.
+	redirectOut := func(loc, where string) finding {
 		f := base
 		f.Kind = "redirect-location"
-		f.Severity = "medium"
-		f.Verdict = "parameter reflected into Location header (open-redirect candidate)"
-		f.Offset = strings.Index(res.Location, marker)
-		f.Snippet = snippetAround([]byte(res.Location), f.Offset, len(marker))
-		f.PoC = strings.ReplaceAll(res.Location, marker, "https://attacker.example/")
-		f.Note = "reflection in Location only; a non-relative attacker URL was not requested. Verify manually before reporting."
-		out = append(out, f)
+		f.Offset = strings.Index(loc, marker)
+		f.Snippet = snippetAround([]byte(loc), f.Offset, len(marker))
+		switch {
+		case isCrossOrigin(loc, target):
+			f.Severity = "high"
+			f.Verdict = "parameter reflected into a cross-origin " + where + " (open-redirect candidate)"
+			f.PoC = strings.ReplaceAll(loc, marker, "https://attacker.example/")
+		case hasScheme(loc):
+			f.Severity = "info"
+			f.Verdict = "parameter reflected into a same-origin absolute " + where + " - not an open redirect by itself"
+		default:
+			f.Severity = "info"
+			f.Verdict = "parameter reflected into a relative " + where + " - not an open redirect by itself"
+		}
+		f.Note = "reflection in the redirect target only; no attacker-controlled request was made. Verify manually."
+		return f
+	}
+	if loc := res.Location; loc != "" && strings.Contains(loc, marker) {
+		out = append(out, redirectOut(loc, "Location header"))
 	} else if res.URL != target && strings.Contains(res.URL, marker) {
-		f := base
-		f.Kind = "redirect-location"
-		f.Severity = "medium"
-		f.Verdict = "parameter reflected into the URL after following redirects (open-redirect candidate)"
-		f.Offset = strings.Index(res.URL, marker)
-		f.Snippet = snippetAround([]byte(res.URL), f.Offset, len(marker))
-		f.PoC = strings.ReplaceAll(res.URL, marker, "https://attacker.example/")
-		f.Note = "redirects were followed (-follow); verify the final hop manually."
-		out = append(out, f)
+		out = append(out, redirectOut(res.URL, "redirected URL"))
 	}
 
 	// 2. Reflections in the body.
@@ -110,6 +118,10 @@ func analyzeParam(client *http.Client, o fetchOpts, rawurl, param string, lim *l
 			// scan.go records the last type= value for any tag; only a
 			// script's type matters to a reader.
 			ctx.ScriptType = ""
+		} else if !isJSScript(ctx.ScriptType) {
+			// A JSON/template <script> is data, not code: the only escape
+			// is a literal "</script" sequence, never a JS quote.
+			ctx.DataScript = true
 		}
 		atStart := idx == ctx.ValueStart
 		f := base
@@ -121,11 +133,6 @@ func analyzeParam(client *http.Client, o fetchOpts, rawurl, param string, lim *l
 		f.Snippet = snippetAround(body, idx, len(marker))
 
 		chars := dangerousFor(ctx, atStart)
-		if ctx.Tag == "script" && !isJSScript(ctx.ScriptType) {
-			// JSON / template script blocks are data: only closing the tag
-			// can escape them, regardless of JS quoting state.
-			chars = []byte{'<'}
-		}
 		if len(chars) == 0 {
 			f.Severity = "info"
 			f.Verdict = fmt.Sprintf("reflection in %s context has no breakout characters to test", f.Kind)
@@ -205,10 +212,18 @@ func probeChar(client *http.Client, o fetchOpts, rawurl, param, marker string, c
 // true when the reflection begins exactly at the start of the attribute value
 // (or other value region), which matters for URL-valued attributes.
 func dangerousFor(c Context, atStart bool) []byte {
+	if c.DataScript {
+		// JSON / template script block: only "</script" escapes it.
+		return []byte{'<', '/'}
+	}
 	var out []byte
 	switch c.Kind {
-	case KindText, KindRcdata, KindScriptRaw, KindStyle:
+	case KindText:
 		out = []byte{'<'}
+	case KindRcdata, KindScriptRaw, KindStyle:
+		// Raw-text and RCDATA elements only end on "</tag", so both bytes
+		// matter. A lone "<" is inert here.
+		out = []byte{'<', '/'}
 	case KindAttrDQ:
 		out = []byte{'"', '<'}
 	case KindAttrSQ:
@@ -216,20 +231,31 @@ func dangerousFor(c Context, atStart bool) []byte {
 	case KindAttrUQ:
 		out = []byte{' ', '>', '"', '\'', '`', '=', '<'}
 	case KindScriptDQ:
-		out = []byte{'"', '<'}
+		out = []byte{'"', '<', '/'}
 	case KindScriptSQ:
-		out = []byte{'\'', '<'}
+		out = []byte{'\'', '<', '/'}
 	case KindScriptTemplate:
-		out = []byte{'`', '$', '<'}
+		out = []byte{'`', '$', '<', '/'}
 	case KindComment:
 		out = []byte{'>', '-'}
-	case KindTag:
-		return nil
 	default:
 		return nil
 	}
 	if isURLAttr(c.Attr) && atStart && isAttrValueKind(c.Kind) {
 		out = append(out, ':', '/')
+	}
+	return dedupeBytes(out)
+}
+
+func dedupeBytes(in []byte) []byte {
+	var seen [256]bool
+	out := in[:0]
+	for _, b := range in {
+		if seen[b] {
+			continue
+		}
+		seen[b] = true
+		out = append(out, b)
 	}
 	return out
 }
@@ -258,29 +284,29 @@ func assess(c Context, probes []charProbe, csp cspInfo, atStart bool) (severity,
 		}
 	}
 
-	if len(literal) > 0 {
+	// "high" is reserved for a demonstrated structural breakout: the exact
+	// sequence that terminates the context survived. Anything less is not
+	// reflected XSS, and reporting it as such is the false positive this
+	// tool exists to avoid.
+	if breakoutDemonstrated(probes, c, atStart) {
 		severity = "high"
-		verdict = fmt.Sprintf("literal %s reflected unescaped in %s context", strings.Join(literal, ", "), contextDesc(c))
-		if breakoutDemonstrated(probes, c, atStart) {
-			verdict += " - the characters that end this context survive; breakout is plausible"
-		} else {
-			verdict += " - note: no character that ends this context survived, so breakout is not demonstrated by this probe alone"
-		}
+		verdict = fmt.Sprintf("literal %s reflected unescaped in %s; the sequence that terminates this context survives", strings.Join(literal, ", "), contextDesc(c))
 		if csp.Present && !csp.AllowsInline() {
 			verdict += "; CSP present and may block inline execution"
 		}
-		poc = pocFor(c)
-		if isURLAttr(c.Attr) && atStart {
-			for _, p := range probes {
-				if p.Literal && (p.Char == ":" || p.Char == "/") {
-					poc = "javascript:alert(document.domain)"
-					break
-				}
-			}
-		}
-		return severity, verdict, poc
+		return severity, verdict, pocFor(c)
 	}
 
+	// A fully attacker-controlled URL attribute is a scheme-injection
+	// candidate, but scheme allow-listing and browser behaviour still have
+	// to be verified, so it is never reported as reflected XSS.
+	if isURLAttr(c.Attr) && atStart && litAny(probes, ":", "/") {
+		return "low", "URL-valued attribute is fully attacker-controlled (scheme-injection candidate); verify any allow-list before reporting", "javascript:alert(document.domain)"
+	}
+
+	if len(literal) > 0 {
+		return "info", fmt.Sprintf("literal %s reflected in %s, but the character(s) that terminate this context did not survive - not exploitable in this context", strings.Join(literal, ", "), contextDesc(c)), ""
+	}
 	if len(encoded) > 0 {
 		return "info", "dangerous characters are encoded in this context (" + strings.Join(encoded, ", ") + ")", ""
 	}
@@ -298,6 +324,20 @@ func assess(c Context, probes []charProbe, csp cspInfo, atStart bool) (severity,
 	return "info", "dangerous characters dropped/transformed in this context (" + strings.Join(detail, "; ") + ")", ""
 }
 
+func litAny(probes []charProbe, chars ...string) bool {
+	for _, p := range probes {
+		if !p.Literal {
+			continue
+		}
+		for _, c := range chars {
+			if p.Char == c {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // breakoutDemonstrated reports whether any literal probe character actually
 // ends the current syntactic context.
 func breakoutDemonstrated(probes []charProbe, c Context, atStart bool) bool {
@@ -307,24 +347,29 @@ func breakoutDemonstrated(probes []charProbe, c Context, atStart bool) bool {
 			lit[p.Char] = true
 		}
 	}
-	if isURLAttr(c.Attr) && atStart && (lit[":"] || lit["/"]) {
-		return true
+	if c.DataScript {
+		return lit["<"] && lit["/"]
 	}
 	switch c.Kind {
-	case KindText, KindRcdata, KindScriptRaw, KindStyle:
+	case KindText:
 		return lit["<"]
+	case KindRcdata, KindScriptRaw, KindStyle:
+		// These elements terminate only on "</tag": a lone "<" does nothing.
+		return lit["<"] && lit["/"]
 	case KindAttrDQ:
 		return lit["\""]
 	case KindAttrSQ:
 		return lit["'"]
 	case KindAttrUQ:
-		return lit[" "] || lit[">"] || lit["\""] || lit["'"] || lit["`"] || lit["="]
+		// Only whitespace or ">" ends an unquoted value. Quote characters
+		// inside it are a parse error, not a terminator.
+		return lit[" "] || lit[">"]
 	case KindScriptDQ:
-		return lit["\""] || lit["<"]
+		return lit["\""] || (lit["<"] && lit["/"])
 	case KindScriptSQ:
-		return lit["'"] || lit["<"]
+		return lit["'"] || (lit["<"] && lit["/"])
 	case KindScriptTemplate:
-		return lit["`"] || lit["<"]
+		return lit["`"] || (lit["<"] && lit["/"])
 	case KindComment:
 		// A comment is closed by "-->", so both bytes must survive.
 		return lit["-"] && lit[">"]
@@ -334,8 +379,16 @@ func breakoutDemonstrated(probes []charProbe, c Context, atStart bool) bool {
 
 // pocFor returns the canonical payload for a context.
 func pocFor(c Context) string {
+	if c.DataScript {
+		return "</script><svg onload=alert(document.domain)>"
+	}
 	switch c.Kind {
-	case KindText, KindRcdata:
+	case KindText:
+		return "<svg onload=alert(document.domain)>"
+	case KindRcdata:
+		if c.Tag != "" {
+			return "</" + c.Tag + "><svg onload=alert(document.domain)>"
+		}
 		return "<svg onload=alert(document.domain)>"
 	case KindAttrDQ:
 		return "\"><svg onload=alert(document.domain)>"
@@ -368,6 +421,32 @@ func isURLAttr(a string) bool {
 		return true
 	}
 	return false
+}
+
+// hasScheme reports whether loc is an absolute URL reference (it carries a
+// scheme), as opposed to a relative reference such as "/landing?next=..." or
+// "landing?next=...". Protocol-relative locations ("//host/...") have no
+// scheme but are cross-origin, so they are classified by isCrossOrigin first.
+func hasScheme(loc string) bool {
+	u, err := url.Parse(strings.TrimSpace(loc))
+	if err != nil {
+		return false
+	}
+	return u.Scheme != ""
+}
+
+// isCrossOrigin reports whether loc points at a different host than base.
+// Relative locations are not cross-origin.
+func isCrossOrigin(loc, base string) bool {
+	lu, err := url.Parse(strings.TrimSpace(loc))
+	if err != nil || lu.Host == "" {
+		return false
+	}
+	bu, err := url.Parse(base)
+	if err != nil || bu.Host == "" {
+		return true
+	}
+	return !strings.EqualFold(lu.Hostname(), bu.Hostname())
 }
 
 // isJSScript reports whether a script type executes as JavaScript.

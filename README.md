@@ -76,8 +76,10 @@ exit `2`; an error writing JSON exits `1`.
 
 1. Generates a random marker (`kx` + 12–20 hex characters) and substitutes it
    for one query parameter at a time.
-2. Fetches the URL once. If the marker appears in a `Location` header, it emits
-   a `redirect-location` finding (open-redirect candidate).
+2. Fetches the URL once. If the marker appears in a `Location` header it emits
+   a `redirect-location` finding: `high` with an open-redirect candidate PoC
+   only when the target is cross-origin, `info` for same-origin absolute and
+   relative bounces (return-URL and locale redirects are routine, not bugs).
 3. Finds every marker occurrence in the body (up to `-max-occ`) and classifies
    the byte-level syntactic context around it with a hand-written HTML scanner
    (`scan.go`). This is why byte offsets are available: standard tokenizers do
@@ -95,23 +97,29 @@ exit `2`; an error writing JSON exits `1`.
 | context | probe characters | example PoC |
 | --- | --- | --- |
 | `html-text` | `<` | `<svg onload=alert(document.domain)>` |
-| `rcdata` (`<textarea>`, `<title>`) | `<` | `<svg onload=alert(document.domain)>` |
+| `rcdata` (`<textarea>`, `<title>`) | `<`, `/` (only `</tag` ends it) | `<svg onload=alert(document.domain)>` |
 | `attr-double-quoted` | `"`, `<` | `"><svg onload=alert(document.domain)>` |
 | `attr-single-quoted` | `'`, `<` | `'><svg onload=alert(document.domain)>` |
 | `attr-unquoted` | space, `>`, `"`, `'`, `` ` ``, `=`, `<` | ` onmouseover=alert(document.domain) x=` |
-| `script-code` | `<` | `</script><svg onload=alert(document.domain)>` |
-| `script-double-quoted` | `"`, `<` | `";alert(document.domain);//` |
-| `script-single-quoted` | `'`, `<` | `';alert(document.domain);//` |
-| `script-template-literal` | `` ` ``, `$`, `<` | `${alert(document.domain)}` |
-| `html-comment` | `>`, `-` | `--><svg onload=alert(document.domain)>` |
-| `style` | `<` | `</style><svg onload=alert(document.domain)>` |
+| `script-code` | `<`, `/` (only `</script` ends it) | `</script><svg onload=alert(document.domain)>` |
+| `script-double-quoted` | `"`, `<`, `/` | `";alert(document.domain);//` |
+| `script-single-quoted` | `'`, `<`, `/` | `';alert(document.domain);//` |
+| `script-template-literal` | `` ` ``, `$`, `<`, `/` | `${alert(document.domain)}` |
+| `html-comment` | `>`, `-` (both needed for `-->`) | `--><svg onload=alert(document.domain)>` |
+| `style` | `<`, `/` (only `</style` ends it) | `</style><svg onload=alert(document.domain)>` |
 | `tag` | none (not probed) | — |
-| `redirect-location` | — | reflection into `Location` header |
+| `redirect-location` | — | cross-origin `Location` only |
+
+A `<script>` whose `type` is not JavaScript (JSON, `__NEXT_DATA__`, templates)
+is treated as data, not code: quotes are inert there, so only `<` and `/` are
+probed, and a breakout needs both.
 
 For URL-valued attributes (`href`, `src`, `action`, `formaction`, `data`,
 `poster`, `xlink:href`, `cite`, `background`, `longdesc`), when the reflection
-starts the value, `:` and `/` are probed too, and the PoC becomes
-`javascript:alert(document.domain)` if either survives verbatim.
+starts the value, `:` and `/` are probed too. If either survives verbatim the
+finding is `low` (scheme-injection candidate) with
+`javascript:alert(document.domain)` as a *candidate* PoC: an allow-list or
+browser behaviour may still stop it, so it is never reported as reflected XSS.
 
 Encodings recognised as "the character is there, just wrapped": HTML numeric
 and named entities, JavaScript `\uXXXX` and `\xXX`, percent-encoding, and a
@@ -119,14 +127,17 @@ leading JS backslash escape (`\"`, `\'`, `` \` ``, `\\`).
 
 ### Severity
 
-* `high` — at least one dangerous character was reflected literally. The
-  verdict also states whether a character that actually *ends* the context
-  survived; a literal `<` inside a quoted attribute is reported `high` but
-  carries an explicit "breakout not demonstrated" caveat, because HTML parsers
-  treat it as data.
-* `medium` — the marker was reflected into a redirect target.
-* `info` — the context has no breakout characters, or the dangerous characters
-  were encoded, transformed or dropped. No PoC is emitted for these.
+* `high` — the structural terminator of the context survived verbatim: `<` in
+  text, the matching quote in a quoted attribute, space/`>` in an unquoted
+  attribute, `-->` in a comment, `</tag` in raw-text/RCDATA/style, a JS quote
+  in a script string, or a cross-origin redirect target. Only these findings
+  carry an executable PoC.
+* `low` — a URL-valued attribute is fully attacker-controlled (`:`/`/`
+  survive). A scheme-injection *candidate*; verify any allow-list.
+* `info` — the reflection is real but not a breakout: the dangerous characters
+  were encoded, transformed or dropped, only non-terminating characters
+  survived (e.g. a literal `<` inside a quoted attribute), or the redirect
+  target was relative/same-origin. No PoC is emitted for these.
 
 ## Honest limits
 

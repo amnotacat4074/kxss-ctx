@@ -163,16 +163,16 @@ func TestDangerousFor(t *testing.T) {
 		want    string
 	}{
 		{Context{Kind: KindText}, false, "<"},
-		{Context{Kind: KindRcdata}, false, "<"},
+		{Context{Kind: KindRcdata}, false, "</"},
 		{Context{Kind: KindAttrDQ}, false, "\"<"},
 		{Context{Kind: KindAttrSQ}, false, "'<"},
 		{Context{Kind: KindAttrUQ}, false, " >\"'`=<"},
-		{Context{Kind: KindScriptRaw}, false, "<"},
-		{Context{Kind: KindScriptDQ}, false, "\"<"},
-		{Context{Kind: KindScriptSQ}, false, "'<"},
-		{Context{Kind: KindScriptTemplate}, false, "`$<"},
+		{Context{Kind: KindScriptRaw}, false, "</"},
+		{Context{Kind: KindScriptDQ}, false, "\"</"},
+		{Context{Kind: KindScriptSQ}, false, "'</"},
+		{Context{Kind: KindScriptTemplate}, false, "`$</"},
 		{Context{Kind: KindComment}, false, ">-"},
-		{Context{Kind: KindStyle}, false, "<"},
+		{Context{Kind: KindStyle}, false, "</"},
 		{Context{Kind: KindTag}, false, ""},
 		{Context{Kind: KindAttrDQ, Attr: "href"}, true, "\"<:/"},
 		{Context{Kind: KindAttrDQ, Attr: "href"}, false, "\"<"},
@@ -253,13 +253,17 @@ func TestAssessLiteralVsEncoded(t *testing.T) {
 		t.Errorf("encoded quotes: no PoC should be offered, got %q", poc)
 	}
 
-	// A literal "<" in a double-quoted attribute does not end the context.
-	sev, verdict, _ = assess(ctx, []charProbe{{Char: "<", Literal: true}}, cspInfo{}, false)
-	if sev != "high" {
-		t.Errorf("literal <: severity = %q, want high (spec)", sev)
+	// A literal "<" in a double-quoted attribute does not end the context:
+	// the quote is the only terminator, so this stays informational.
+	sev, verdict, poc = assess(ctx, []charProbe{{Char: "<", Literal: true}}, cspInfo{}, false)
+	if sev != "info" {
+		t.Errorf("literal <: severity = %q, want info", sev)
 	}
-	if !strings.Contains(verdict, "not demonstrated") {
-		t.Errorf("literal <: verdict should carry the breakout caveat, got %q", verdict)
+	if !strings.Contains(verdict, "not exploitable") {
+		t.Errorf("literal <: verdict should carry the not-exploitable caveat, got %q", verdict)
+	}
+	if poc != "" {
+		t.Errorf("literal <: no PoC should be offered, got %q", poc)
 	}
 }
 
