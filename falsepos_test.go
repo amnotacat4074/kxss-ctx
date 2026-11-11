@@ -95,8 +95,13 @@ func falsePositiveServer() *httptest.Server {
 			// TRUE POSITIVE: raw reflection in a double-quoted attribute.
 			fmt.Fprintf(w, `<input value="%s">`, v)
 		case "/cross-redirect":
-			// TRUE POSITIVE: attacker-controlled cross-origin Location.
-			w.Header().Set("Location", "https://evil.example/?n="+v)
+			// TRUE POSITIVE: the value becomes the redirect HOST.
+			w.Header().Set("Location", "https://"+v+".evil.example/")
+			w.WriteHeader(http.StatusFound)
+		case "/fixed-host-redirect":
+			// Cross-host but server-fixed destination: the value only lands in
+			// a query parameter, exactly like the AT&T ISAM kickoff endpoint.
+			w.Header().Set("Location", "https://oidc.example/kickoff?alt_dest="+v)
 			w.WriteHeader(http.StatusFound)
 		case "/same-redirect":
 			// Same-origin / relative bounce: routine, not an open redirect.
@@ -146,6 +151,7 @@ func TestFalsePositiveCorpus(t *testing.T) {
 		{"/raw-text", "high"},
 		{"/raw-attr", "high"},
 		{"/cross-redirect", "high"},
+		{"/fixed-host-redirect", "info"},
 		{"/same-redirect", "info"},
 	}
 

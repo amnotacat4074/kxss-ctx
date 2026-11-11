@@ -86,10 +86,13 @@ func analyzeParam(client *http.Client, o fetchOpts, rawurl, param string, lim *l
 		f.Offset = strings.Index(loc, marker)
 		f.Snippet = snippetAround([]byte(loc), f.Offset, len(marker))
 		switch {
-		case isCrossOrigin(loc, target):
+		case locationControlsTarget(loc, marker):
 			f.Severity = "high"
-			f.Verdict = "parameter reflected into a cross-origin " + where + " (open-redirect candidate)"
-			f.PoC = strings.ReplaceAll(loc, marker, "https://attacker.example/")
+			f.Verdict = "parameter controls the host/scheme of the " + where + " (open-redirect candidate)"
+			f.PoC = strings.ReplaceAll(loc, marker, "attacker.example")
+		case isCrossOrigin(loc, target):
+			f.Severity = "info"
+			f.Verdict = "parameter reflected into a cross-origin but server-fixed " + where + " - the destination host is not attacker-controlled, so this is not an open redirect by itself"
 		case hasScheme(loc):
 			f.Severity = "info"
 			f.Verdict = "parameter reflected into a same-origin absolute " + where + " - not an open redirect by itself"
@@ -97,7 +100,7 @@ func analyzeParam(client *http.Client, o fetchOpts, rawurl, param string, lim *l
 			f.Severity = "info"
 			f.Verdict = "parameter reflected into a relative " + where + " - not an open redirect by itself"
 		}
-		f.Note = "reflection in the redirect target only; no attacker-controlled request was made. Verify manually."
+		f.Note = "the marker was only reflected; no attacker-controlled destination was proven. Verify manually if this parameter may accept a full URL."
 		return f
 	}
 	if loc := res.Location; loc != "" && strings.Contains(loc, marker) {
@@ -447,6 +450,27 @@ func isCrossOrigin(loc, base string) bool {
 		return true
 	}
 	return !strings.EqualFold(lu.Hostname(), bu.Hostname())
+}
+
+// locationControlsTarget reports whether the reflection lands in the scheme or
+// host of the redirect target - the only positions that let an attacker choose
+// where the browser goes. A value echoed into the query string of a
+// server-configured host (e.g. an IdP kickoff appending alt_dest) is a
+// reflection, not an open redirect.
+func locationControlsTarget(loc, marker string) bool {
+	trimmed := strings.TrimSpace(loc)
+	// Protocol-relative form: //<marker>... or /\<marker>...
+	if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/\\") {
+		rest := strings.TrimLeft(trimmed, "/\\")
+		if strings.HasPrefix(rest, marker) {
+			return true
+		}
+	}
+	lu, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(lu.Scheme, marker) || strings.Contains(lu.Host, marker)
 }
 
 // isJSScript reports whether a script type executes as JavaScript.
