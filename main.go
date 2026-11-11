@@ -150,6 +150,11 @@ func main() {
 		verbose     bool
 		colorMode   string
 		minSeverity string
+		domain      string
+		outDir      string
+		reuse       bool
+		reconOnly   bool
+		maxURLs     int
 	)
 	headers := &headerList{h: http.Header{}}
 	flag.StringVar(&single, "u", "", "single URL to test; must include a query string")
@@ -166,6 +171,11 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "verbose diagnostics on stderr")
 	flag.StringVar(&colorMode, "color", "auto", "colour output: auto|always|never (auto = only on a terminal; NO_COLOR disables auto; -json never colours)")
 	flag.StringVar(&minSeverity, "min-severity", "low", "minimum severity to report: info|low|medium|high")
+	flag.StringVar(&domain, "d", "", "domain: run subfinder/assetfinder/httpx/katana/gau/uro, then scan every discovered URL with a query string")
+	flag.StringVar(&outDir, "o", "", "recon output directory (default ./recon-<domain>)")
+	flag.BoolVar(&reuse, "reuse", false, "reuse existing recon files instead of re-running a stage")
+	flag.BoolVar(&reconOnly, "recon-only", false, "with -d: build the URL list and stop")
+	flag.IntVar(&maxURLs, "max-urls", 0, "cap the number of URLs taken from recon (0 = no cap)")
 	flag.Var(headers, "H", "extra request header 'Name: value' (repeatable)")
 	flag.Parse()
 
@@ -183,13 +193,35 @@ func main() {
 	useColor := colorEnabled(colorMode, jsonOut, noColorEnv, stdoutIsTerminal())
 	minRank := severityRank[minSeverity]
 
-	urls, err := readURLs(single, file)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "kxss-ctx: %v\n", err)
-		os.Exit(2)
+	var urls []string
+	var err error
+	if domain != "" {
+		dir := outDir
+		if dir == "" {
+			dir = "recon-" + domain
+		}
+		urls, err = runRecon(domain, dir, reuse, verbose)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kxss-ctx: recon: %v\n", err)
+			os.Exit(1)
+		}
+		if reconOnly {
+			fmt.Fprintf(os.Stderr, "kxss-ctx: %d in-scope URLs written under %s\n", len(urls), dir)
+			return
+		}
+		if maxURLs > 0 && len(urls) > maxURLs {
+			fmt.Fprintf(os.Stderr, "kxss-ctx: capping %d URLs to %d (-max-urls)\n", len(urls), maxURLs)
+			urls = urls[:maxURLs]
+		}
+	} else {
+		urls, err = readURLs(single, file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kxss-ctx: %v\n", err)
+			os.Exit(2)
+		}
 	}
 	if len(urls) == 0 {
-		fmt.Fprintln(os.Stderr, "kxss-ctx: no URLs supplied (use -u, -f or stdin)")
+		fmt.Fprintln(os.Stderr, "kxss-ctx: no URLs supplied (use -d, -u, -f or stdin)")
 		flag.Usage()
 		os.Exit(2)
 	}
