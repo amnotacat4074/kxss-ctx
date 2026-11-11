@@ -28,6 +28,8 @@ Requires Go 1.21+. There are no third-party modules.
 
 ## Usage
 
+Non-HTML responses (JavaScript, JSON, plain text) are reported as `info` with context `non-html`: a browser does not parse them as markup, so a literal `<` there is not an HTML breakout.
+
 ```
 # one URL; every query parameter is tested
 kxss-ctx -u 'https://example.test/search?q=hello&page=1'

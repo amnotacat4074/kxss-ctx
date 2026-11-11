@@ -115,7 +115,27 @@ func analyzeParam(client *http.Client, o fetchOpts, rawurl, param string, lim *l
 	if len(indexes) > maxOcc {
 		indexes = indexes[:maxOcc]
 	}
+	ctRaw := res.Header.Get("Content-Type")
+	// HTML context classification is only meaningful for an HTML document. A
+	// reflection inside application/javascript, application/json or
+	// text/plain is not parsed as markup by a browser, so a literal "<" there
+	// is not an HTML breakout - which is exactly the false positive kxss
+	// produces on tracking endpoints that return JavaScript.
+	htmlDoc := strings.Contains(strings.ToLower(ctRaw), "html")
 	for occ, idx := range indexes {
+		if !htmlDoc {
+			f := base
+			f.Offset = idx
+			f.Kind = "non-html"
+			f.Snippet = snippetAround(body, idx, len(marker))
+			f.Severity = "info"
+			f.Verdict = fmt.Sprintf("reflected in a non-HTML response (Content-Type: %q) - a browser does not parse this as an HTML document, so HTML breakout characters do not apply", ctRaw)
+			if ctRaw == "" {
+				f.Note = "no Content-Type header; a browser may sniff. Verify manually."
+			}
+			out = append(out, f)
+			continue
+		}
 		ctx := contextAt(body, idx)
 		if ctx.Tag != "script" {
 			// scan.go records the last type= value for any tag; only a
